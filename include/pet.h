@@ -419,6 +419,10 @@ __isl_give isl_id_to_ast_expr *pet_stmt_build_ast_exprs(struct pet_stmt *stmt,
 __isl_give isl_printer *pet_stmt_print_body(struct pet_stmt *stmt,
 	__isl_take isl_printer *p, __isl_keep isl_id_to_ast_expr *ref2expr);
 
+__isl_give isl_printer *print_pet_expr_ctrl(__isl_take isl_printer *p,
+  __isl_keep pet_expr *expr, __isl_keep isl_id_to_ast_expr *ref2expr,
+  const char *data_type, isl_bool nakata);
+
 /* This structure represents a defined type.
  * "name" is the name of the type, while "definition" is a string
  * representation of its definition.

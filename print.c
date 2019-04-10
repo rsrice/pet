@@ -41,6 +41,8 @@
 #include <isl/printer.h>
 #include <isl/val.h>
 #include <pet.h>
+#include <string.h>
+#include <assert.h>
 #include "expr.h"
 #include "print.h"
 #include "scop.h"
@@ -389,9 +391,243 @@ static int is_postfix(enum pet_op_type op)
 	}
 }
 
+static isl_bool is_printed_expr(__isl_keep pet_expr *expr,
+                                __isl_keep isl_id_to_ast_expr *ref2expr)
+{
+  isl_ast_expr *ast_expr;
+  isl_id *id;
+  const char *none_symbol = "__pet_none";
+  isl_bool ret;
+
+  switch (expr->type) {
+  case pet_expr_error:
+  case pet_expr_int:
+  case pet_expr_double:
+    return isl_bool_true;
+
+
+  case pet_expr_call:
+    return isl_bool_true;
+
+
+  case pet_expr_cast:
+    return is_printed_expr(expr->args[0], ref2expr);
+
+
+  case pet_expr_access:
+    if (!isl_id_to_ast_expr_has(ref2expr, expr->acc.ref_id))
+      return isl_bool_true;
+
+    ast_expr = isl_id_to_ast_expr_get(ref2expr,
+                                      isl_id_copy(expr->acc.ref_id));
+
+    ret = isl_bool_true;
+
+    if (isl_ast_expr_get_type(ast_expr) == isl_ast_expr_id) {
+      id = isl_ast_expr_get_id(ast_expr);
+      if (strncmp(isl_id_get_name(id), none_symbol, strlen(none_symbol)) == 0) {
+        ret = isl_bool_false;
+      }
+      isl_id_free(id);
+    }
+
+    isl_ast_expr_free(ast_expr);
+
+    return ret;
+
+
+  case pet_expr_op:
+    switch (expr->n_arg) {
+    case 1:
+      return isl_bool_true;
+
+    case 2:
+      switch (expr->op) {
+      case pet_op_add:
+      case pet_op_sub:
+        return
+          is_printed_expr(expr->args[pet_bin_lhs], ref2expr) ||
+          is_printed_expr(expr->args[pet_bin_rhs], ref2expr);
+
+      case pet_op_mul:
+      case pet_op_div:
+      case pet_op_mod:
+        return 
+          is_printed_expr(expr->args[pet_bin_lhs], ref2expr) &&
+          is_printed_expr(expr->args[pet_bin_rhs], ref2expr);
+
+      default:
+        return isl_bool_true;
+      }
+
+    case 3:
+      return isl_bool_true;
+    }
+  }
+
+	return isl_bool_true;
+}
+
 static __isl_give isl_printer *print_pet_expr(__isl_take isl_printer *p,
 	__isl_keep pet_expr *expr, int outer,
 	__isl_keep isl_id_to_ast_expr *ref2expr);
+
+static int count_reg(__isl_keep pet_expr *expr,
+                     __isl_keep isl_id_to_ast_expr *ref2expr)
+{
+  if (expr->type == pet_expr_access) {
+    if (!isl_id_to_ast_expr_has(ref2expr, expr->acc.ref_id))
+      return 0;
+
+    isl_ast_expr *ast_expr = isl_id_to_ast_expr_get(ref2expr,
+                                                    isl_id_copy(expr->acc.ref_id));
+
+    int ret = 0;
+    const char *none_symbol = "__pet_none";
+
+    if (isl_ast_expr_get_type(ast_expr) == isl_ast_expr_id) {
+      isl_id *id = isl_ast_expr_get_id(ast_expr);
+      if (strncmp(isl_id_get_name(id), none_symbol, strlen(none_symbol)) == 0) {
+        ret = -1;
+      }
+      isl_id_free(id);
+    }
+
+    isl_ast_expr_free(ast_expr);
+
+    return ret;
+  }
+
+  if (expr->type == pet_expr_op && expr->n_arg == 2) {
+    int left  = count_reg(expr->args[pet_bin_lhs], ref2expr);
+    int right = count_reg(expr->args[pet_bin_rhs], ref2expr);
+
+    if (left == -1 && right == -1)
+      return -1;
+
+    if ((left == -1 || right == -1) &&
+        (expr->op == pet_op_mul ||
+         expr->op == pet_op_div ||
+         expr->op == pet_op_mod))
+      return -1;
+
+    if (left == right)
+      return left + 1;
+
+    return (left > right) ? left : right;
+  }
+
+  return 0;
+}
+
+__isl_give isl_printer *print_pet_expr_nakata(__isl_take isl_printer *p,
+  __isl_keep pet_expr *expr, __isl_keep isl_id_to_ast_expr *ref2expr, int usage)
+{
+  int left  = count_reg(expr->args[pet_bin_lhs], ref2expr);
+  int right = count_reg(expr->args[pet_bin_rhs], ref2expr);
+
+  if (right == -1)
+    return print_pet_expr_nakata(p, expr->args[pet_bin_lhs], ref2expr, usage);
+  if (left == -1) {
+    p = print_pet_expr_nakata(p, expr->args[pet_bin_rhs], ref2expr, usage);
+    if (expr->op != pet_op_sub)
+      return p;
+    p = isl_printer_print_str(p, " __rn");
+    p = isl_printer_print_int(p, usage);
+    p = isl_printer_print_str(p, " = - __rn");
+    p = isl_printer_print_int(p, usage);
+    p = isl_printer_print_str(p, ";");
+    return p;
+  }
+
+  if (left == 0 && right == 0) {
+    p = isl_printer_print_str(p, " __rn");
+    p = isl_printer_print_int(p, usage);
+    p = isl_printer_print_str(p, " = (");
+    p = print_pet_expr(p, expr->args[pet_bin_lhs], 0, ref2expr);
+    p = isl_printer_print_str(p, " ");
+		p = isl_printer_print_str(p, pet_op_str(expr->op));
+		p = isl_printer_print_str(p, " ");
+    p = print_pet_expr(p, expr->args[pet_bin_rhs], 0, ref2expr);    
+		return isl_printer_print_str(p, ");");
+  }
+  if (right == 0) {
+    p = print_pet_expr_nakata(p, expr->args[pet_bin_lhs], ref2expr, usage);
+    p = isl_printer_print_str(p, " __rn");
+    p = isl_printer_print_int(p, usage);
+    p = isl_printer_print_str(p, " = (__rn");
+    p = isl_printer_print_int(p, usage);
+    p = isl_printer_print_str(p, " ");
+		p = isl_printer_print_str(p, pet_op_str(expr->op));
+		p = isl_printer_print_str(p, " ");
+    p = print_pet_expr(p, expr->args[pet_bin_rhs], 0, ref2expr);
+		return isl_printer_print_str(p, ");");
+  }
+  if (left == 0) {
+    p = print_pet_expr_nakata(p, expr->args[pet_bin_rhs], ref2expr, usage);
+    p = isl_printer_print_str(p, " __rn");
+    p = isl_printer_print_int(p, usage);
+    p = isl_printer_print_str(p, " = (");
+    p = print_pet_expr(p, expr->args[pet_bin_lhs], 0, ref2expr);
+    p = isl_printer_print_str(p, " ");
+		p = isl_printer_print_str(p, pet_op_str(expr->op));
+		p = isl_printer_print_str(p, " __rn");
+    p = isl_printer_print_int(p, usage);
+		return isl_printer_print_str(p, ");");
+  }
+
+  if (left >= right) {
+    p = print_pet_expr_nakata(p, expr->args[pet_bin_lhs], ref2expr, usage);
+    p = print_pet_expr_nakata(p, expr->args[pet_bin_rhs], ref2expr, usage + 1);
+  }
+  else {
+    p = print_pet_expr_nakata(p, expr->args[pet_bin_rhs], ref2expr, usage);
+    p = print_pet_expr_nakata(p, expr->args[pet_bin_lhs], ref2expr, usage + 1);
+  }
+
+  p = isl_printer_print_str(p, " __rn");
+  p = isl_printer_print_int(p, usage);
+  p = isl_printer_print_str(p, " = (__rn");
+  p = isl_printer_print_int(p, usage + (left >= right ? 0 : 1));
+  p = isl_printer_print_str(p, " ");
+  p = isl_printer_print_str(p, pet_op_str(expr->op));
+  p = isl_printer_print_str(p, " __rn");
+  p = isl_printer_print_int(p, usage + (left >= right ? 1 : 0));
+  p = isl_printer_print_str(p, ");");
+
+  return p;
+}
+
+__isl_give isl_printer *print_pet_expr_ctrl(__isl_take isl_printer *p,
+   __isl_keep pet_expr *expr, __isl_keep isl_id_to_ast_expr *ref2expr,
+   const char *data_type, isl_bool nakata)
+{
+  assert(expr->type == pet_expr_op && expr->n_arg == 2);
+  assert(expr->op == pet_op_assign);
+
+  int i;
+  int regnum = count_reg(expr, ref2expr);
+
+  if (!nakata || regnum < 1) {
+    p = isl_printer_print_str(p, "{ __rn0 = ");
+    p = print_pet_expr(p, expr->args[pet_bin_rhs], 0, ref2expr);
+    p = isl_printer_print_str(p, "; }");
+    return p;
+  }
+
+  p = isl_printer_print_str(p, "{");
+  for (i = 1; i < regnum; i++) {
+    p = isl_printer_print_str(p, " ");
+    p = isl_printer_print_str(p, data_type);
+    p = isl_printer_print_str(p, " __rn");
+    p = isl_printer_print_int(p, i);
+    p = isl_printer_print_str(p, ";");
+  }
+  p = print_pet_expr_nakata(p, expr->args[pet_bin_rhs], ref2expr, 0);
+  p = isl_printer_print_str(p, " }");
+
+  return p;
+}
 
 /* Print operation expression "expr" to "p".
  *
@@ -401,6 +637,8 @@ static __isl_give isl_printer *print_pet_expr(__isl_take isl_printer *p,
 static __isl_give isl_printer *print_op(__isl_take isl_printer *p,
 	__isl_keep pet_expr *expr, __isl_keep isl_id_to_ast_expr *ref2expr)
 {
+  isl_bool left, right;
+
 	switch (expr->n_arg) {
 	case 1:
 		if (!is_postfix(expr->op))
@@ -410,6 +648,34 @@ static __isl_give isl_printer *print_op(__isl_take isl_printer *p,
 			p = isl_printer_print_str(p, pet_op_str(expr->op));
 		break;
 	case 2:
+    left  = is_printed_expr(expr->args[pet_bin_lhs], ref2expr);
+    right = is_printed_expr(expr->args[pet_bin_rhs], ref2expr);
+
+    switch (expr->op) {
+    case pet_op_add:
+    case pet_op_sub:
+      if (left && right)
+        break;
+      if (left)
+        return print_pet_expr(p, expr->args[pet_bin_lhs], 0, ref2expr);
+      if (right) {
+        if (expr->op == pet_op_sub)
+          p = isl_printer_print_str(p, "-");
+        return print_pet_expr(p, expr->args[pet_bin_rhs], 0, ref2expr);
+      }
+      return isl_printer_print_int(p, 0);
+
+    case pet_op_mul:
+    case pet_op_div:
+    case pet_op_mod:
+      if (left && right)
+        break;
+      return isl_printer_print_int(p, 0);
+
+    default:
+      break;
+    }
+
 		p = print_pet_expr(p, expr->args[pet_bin_lhs], 0,
 					ref2expr);
 		p = isl_printer_print_str(p, " ");
